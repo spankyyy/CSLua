@@ -6,11 +6,12 @@ local settings = {
 	on = false,
 	resx = 1920,
 	resy = 1080,
-	focalLength = 40,
+	focalLength = 20,
+	focalDistance = 0,
 	sensorHeight = 35,
 	samples = 8,
 	maxDepth = 16,
-	exposure = 4,
+	exposure = 1,
 	denoise = true,
 }
 local drawAlbedoTab, drawNormalTab = true, true
@@ -52,6 +53,14 @@ local rtNormal = GetRenderTargetEx(
 	0,                               -- No RT flags
 	IMAGE_FORMAT_RGBA8888            -- RGB image format with 8 bits per channel
 )
+local rtDepth = GetRenderTargetEx(
+	"VisTracerDepth",                     -- Name of the render target
+	1, 1, RT_SIZE_FULL_FRAME_BUFFER, -- Resize to screen res automatically
+	MATERIAL_RT_DEPTH_SEPARATE,      -- Create a dedicated depth/stencil buffer
+	bit.bor(1, 256),                 -- Texture flags for point sampling and no mips
+	0,                               -- No RT flags
+	IMAGE_FORMAT_RGBA8888            -- RGB image format with 8 bits per channel
+)
 
 local rtMat = CreateMaterial("VisTracer", "UnlitGeneric", {
 	["$basetexture"] = rt:GetName(),
@@ -63,6 +72,10 @@ local rtMatAlbedo = CreateMaterial("VisTracerAlbedo", "UnlitGeneric", {
 })
 local rtMatNormal = CreateMaterial("VisTracerNormal", "UnlitGeneric", {
 	["$basetexture"] = rtNormal:GetName(),
+	["$translucent"] = "1" -- Enables transparency on the material
+})
+local rtMatDepth = CreateMaterial("VisTracerDepth", "UnlitGeneric", {
+	["$basetexture"] = rtDepth:GetName(),
 	["$translucent"] = "1" -- Enables transparency on the material
 })
 
@@ -130,6 +143,16 @@ function normalTab:Paint(w, h)
 	surface.DrawTexturedRect(-offsetx, -offsety, (1920 / settings.resx) * w, (1080 / settings.resy) * h)
 end
 
+local depthTab = vgui.Create("DPanel")
+function depthTab:Paint(w, h)
+	surface.SetDrawColor(Color(0, 0, 0))
+	surface.DrawRect(0, 0, w, h)
+
+	surface.SetDrawColor(Color(255, 255, 255))
+	surface.SetMaterial(rtMatDepth)
+	surface.DrawTexturedRect(-offsetx, -offsety, (1920 / settings.resx) * w, (1080 / settings.resy) * h)
+end
+
 local settingTab = vgui.Create("DPanel")
 
 
@@ -137,7 +160,8 @@ local settingTab = vgui.Create("DPanel")
 tabs:AddSheet("Output", outputTab, "icon16/camera.png", false, false, "tab1")
 tabs:AddSheet("Albedo", albedoTab, "icon16/color_wheel.png", false, false, "tab2")
 tabs:AddSheet("Normal", normalTab, "icon16/bricks.png", false, false, "tab3")
-tabs:AddSheet("Render Settings", settingTab, "icon16/cog_edit.png", false, false, "tab4")
+tabs:AddSheet("Depth", depthTab, "icon16/contrast_low.png", false, false, "tab4")
+tabs:AddSheet("Render Settings - UNUSED", settingTab, "icon16/cog_edit.png", false, false, "tab5")
 local entities = {}
 for k,v in pairs(ents.GetAll()) do
 	local class = v:GetClass()
@@ -201,10 +225,12 @@ local hdr = vistrace.CreateRenderTarget(settings.resx, settings.resy, VisTraceRT
 local srgb = vistrace.CreateRenderTarget(settings.resx, settings.resy, VisTraceRTFormat.RGB888)
 local albedo = vistrace.CreateRenderTarget(settings.resx, settings.resy, VisTraceRTFormat.Albedo)
 local normal = vistrace.CreateRenderTarget(settings.resx, settings.resy, VisTraceRTFormat.Normal)
-
+local depth = vistrace.CreateRenderTarget(settings.resx, settings.resy, VisTraceRTFormat.RF)
 
 
 local DEFAULT_MATERIAL = vistrace.CreateMaterial()
+DEFAULT_MATERIAL:Roughness(0.8)
+DEFAULT_MATERIAL:IoR(1.2)
 
 
 local WATER_MATERIAL = vistrace.CreateMaterial()
@@ -341,9 +367,9 @@ local function SaturateRT(rt, sat)
 	for y = 0, rt:GetHeight() - 1 do
 		for x = 0, rt:GetWidth() - 1 do
 			local pixel = rt:GetPixel(x, y)
-			pixel = vibrance(pixel, sat)
+			pixel = vibrance(pixel, sat * 0.5)
 			local output = RGBToHSV(pixel)
-			output[2] = output[2] + sat * 0.1
+			output[2] = output[2] + sat * 0.05
 			rt:SetPixel(x, y, HSVtoRGB(output))
 		end
 	end
@@ -373,6 +399,35 @@ local function filmGrainRT(rt, strength)
 			local pre = rt:GetPixel(x, y)
 			local post = pre + Vector(math.Rand(0, strength), math.Rand(0, strength), math.Rand(0, strength))
 			rt:SetPixel(x, y, post)
+		end
+	end
+end
+local function blurKernel(rt, x, y, size)
+	local size = math.Round(size)
+	if size == 0 then return rt:GetPixel(x, y) end
+	local averaged, i = Vector(0, 0, 0), 0
+	local sx, sy = rt:GetWidth(), rt:GetHeight()
+	for ky=-size, size do
+		for kx=-size, size do
+			local ox, oy = x - kx, y - ky
+			if ox >= 0 and ox < sx and oy >= 0 and oy < sy then
+				local distanceSquaredToCenter = math.DistanceSqr(x, y, ox, oy)
+				if distanceSquaredToCenter <= size ^ 2 then
+					averaged = averaged + rt:GetPixel(ox, oy)
+					i = i + 1
+				end
+			end
+		end
+	end
+	return averaged / i
+end
+local function blurDof(rt, rtDepth, strength, focalDistance)
+	local sx, sy = rt:GetWidth(), rt:GetHeight()
+	for y = 0, sy - 1 do
+		for x = 0, sx - 1 do
+			local size = math.abs(rtDepth:GetPixel(x, y)[1] - focalDistance) * strength
+			local size = math.Clamp(size, 0, 8)
+			rt:SetPixel(x, y, blurKernel(rt, x, y, size))
 		end
 	end
 end
@@ -620,7 +675,7 @@ hook.Add("HUDPaint", "VisTracer", function()
 					rgb = hdr:GetPixel(x, y)
 	
 					-- Perform custom per-pixel post processing
-					local gamma = 1 / 2.2
+					local gamma = 1 / 1.5
 					for i = 1, 3 do
 						rgb[i] = math.pow(rgb[i], gamma)
 					end
@@ -629,7 +684,7 @@ hook.Add("HUDPaint", "VisTracer", function()
 				else
 					local rayDir = getCamDir(x, y, camScaleVertical, camScaleHorizontal, me:EyeAngles())
 					local camRay = accel:Traverse(me:EyePos(), rayDir, nil, nil, 0, coneAngle)
-					if camRay then print("mat flag is " .. camRay:MaterialFlags()) end
+					
 					rgb = tracePixel(me:EyePos(), rayDir)
 					if not rgb then rgb = Vector(0, 0, 0) end
 					local rgb = (rgb[1] == rgb[1]) and rgb or Vector(0)
@@ -638,6 +693,7 @@ hook.Add("HUDPaint", "VisTracer", function()
 					if camRay and not camRay:HitSky() then
 						albedo:SetPixel(x, y, camRay:Albedo())
 						normal:SetPixel(x, y, camRay:Normal())
+						depth:SetPixel(x, y, Vector(camRay:Distance(), 0, 0))
 						if drawAlbedoTab then
 							render.PushRenderTarget(rtAlbedo)
 								local albedo = camRay:Albedo() or Vector(1, 0, 1)
@@ -658,6 +714,38 @@ hook.Add("HUDPaint", "VisTracer", function()
 									math.Clamp(normal[1] * 255, 0, 255), 
 									math.Clamp(normal[2] * 255, 0, 255), 
 									math.Clamp(normal[3] * 255, 0, 255), 
+									255, true, true
+								)
+							render.PopRenderTarget()
+						end
+						if drawNormalTab then
+							render.PushRenderTarget(rtDepth)
+								local dist = camRay:Distance()
+
+								local dist = math.abs(dist - settings.focalDistance)
+								local depth = 1 - (1 / (1 + (dist * 0.001)))
+								render.SetViewPort(x + 1, y + 1, 1, 1)
+								render.Clear(
+									math.Clamp(depth * 255, 0, 255), 
+									math.Clamp(depth * 255, 0, 255), 
+									math.Clamp(depth * 255, 0, 255), 
+									255, true, true
+								)
+							render.PopRenderTarget()
+						end
+					else
+						depth:SetPixel(x, y, Vector(2048, 0, 0))
+						if drawNormalTab then
+							render.PushRenderTarget(rtDepth)
+								local dist = 2048
+
+								local dist = math.abs(dist - settings.focalDistance)
+								local depth = 1 - (1 / (1 + (dist * 0.05)))
+								render.SetViewPort(x + 1, y + 1, 1, 1)
+								render.Clear(
+									math.Clamp(depth * 255, 0, 255), 
+									math.Clamp(depth * 255, 0, 255), 
+									math.Clamp(depth * 255, 0, 255), 
 									255, true, true
 								)
 							render.PopRenderTarget()
@@ -686,19 +774,22 @@ hook.Add("HUDPaint", "VisTracer", function()
 				-- Pre HDR
 				local lumMean = GetRTLuminanceMean(hdr, 0, 0)
 				local lumMult = math.Clamp(0.75 / lumMean, 0, 32)
+				MultiplyRT(hdr, 1)
 
 				-- During HDR
-				hdr:Tonemap(true, 3)
+				hdr:Tonemap(false, settings.exposure)
 				if settings.denoise then hdr:Denoise({
 					Albedo = albedo,
 					Normal = normal,
 					AlbedoNoisy = false,
 					NormalNoisy = false,
-					HDR = true,
-					sRGB = false
+					HDR = false,
+					sRGB = true
 				}) end
 
 				-- Post HDR
+				--blurDof(hdr, depth, 0.001, settings.focalDistance)
+				--SaturateRT(hdr, 0.5)
 				filmGrainRT(hdr, 0.005 * lumMult)
 
 			end
